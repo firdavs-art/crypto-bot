@@ -196,7 +196,7 @@ USER'S TASK LIST:
 {tasks}
 
 YOUR CAPABILITIES:
-- You can search the web for real-time crypto news, prices, and market data
+- You have knowledge of crypto markets and can reason about prices and news
 - You remember and update the user's preferences and tasks
 - You give honest buy/sell/hold opinions based on the portfolio data
 - You explain complex crypto concepts simply
@@ -208,8 +208,6 @@ IMPORTANT INSTRUCTIONS:
 3. When the user tells you their preferences (e.g. "I prefer long-term holds", "alert me when SOL drops 5%"), acknowledge it and tell them you've saved it
 4. When they give you a task (e.g. "watch BTC this week", "remind me to check DOGE on Friday"), acknowledge and save it
 5. Always caveat investment advice as not financial advice
-6. Search the web for any current market news, prices, or events you need
-
 To save a preference, include this exact tag in your response (it won't be shown to user):
 [SAVE_PREF: your preference text here]
 
@@ -229,7 +227,6 @@ To delete a task when done:
         "max_tokens": 1024,
         "system": system,
         "messages": memory["conversation"],
-        "tools": [{"type": "web_search_20250305", "name": "web_search"}]
     }
 
     try:
@@ -239,12 +236,13 @@ To delete a task when done:
                 headers={
                     "x-api-key": ANTHROPIC_KEY,
                     "anthropic-version": "2023-06-01",
-                    "anthropic-beta": "interleaved-thinking-2025-05-14",
                     "content-type": "application/json",
                 },
                 json=payload
             )
-            r.raise_for_status()
+            if r.status_code != 200:
+                logger.error(f"Anthropic API error {r.status_code}: {r.text}")
+                return f"❌ AI error ({r.status_code}): {r.text[:200]}"
             data = r.json()
 
         # Extract text from response
@@ -367,8 +365,8 @@ async def daily_update(context: ContextTypes.DEFAULT_TYPE):
 
         # AI daily insight with web search
         insight = await ask_claude(
-            "Give me my daily portfolio briefing. Search for any major crypto news today. "
-            "What should I watch? Any of my coins moving significantly? Keep it punchy — 4-5 bullet points max.",
+            "Give me my daily portfolio briefing. Which of my coins are moving significantly today? "
+            "What should I watch? Any key observations? Keep it punchy — 4-5 bullet points max.",
             port_json
         )
         await context.bot.send_message(
