@@ -1,11 +1,14 @@
 """
-Crypto + Stock Portfolio Telegram Bot
-- Daily 7am UK briefing: geopolitical, macro, portfolio news
-- /prices command: live prices with P&L
-- AI Agent: powered by Groq (free) — advises on news, portfolio, buy/sell
+Personal Finance AI Telegram Bot
+- Daily 7am UK briefing: geopolitical, macro, crypto & portfolio news
+- /prices  — live portfolio with P&L
+- /brief   — trigger morning briefing on demand
+- /summary — AI portfolio summary & honest analysis
+- /clear   — reset conversation
+- AI Agent (Groq/Llama) — full portfolio context, buy/sell advice
 """
 
-import os, json, asyncio, logging, re
+import os, asyncio, logging, re
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 import httpx
@@ -14,10 +17,7 @@ import yfinance as yf
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -29,27 +29,40 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 UK_TZ      = ZoneInfo("Europe/London")
 
 # ── Portfolio ──────────────────────────────────────────────────────────────────
-CRYPTO = {
-    "ATOM":  {"name": "Cosmos",           "qty": 225.00,    "buy": 5.59},
-    "ZRO":   {"name": "LayerZero",        "qty": 142.50,    "buy": 1.29},
-    "COW":   {"name": "CoW Protocol",     "qty": 1000.00,   "buy": 0.3339},
-    "PENGU": {"name": "Pudgy Penguins",   "qty": 25000.00,  "buy": 0.021514},
-    "DOGE":  {"name": "Dogecoin",         "qty": 1750.00,   "buy": 0.091375},
-    "ZK":    {"name": "ZKsync",           "qty": 5000.00,   "buy": 0.057838},
-    "RSC":   {"name": "ResearchCoin",     "qty": 1000.00,   "buy": 0.30},
-    "SOL":   {"name": "Solana",           "qty": 1.00,      "buy": 175.00},
-    "FUEL":  {"name": "Fuel Network",     "qty": 60014.00,  "buy": 0.006715},
-    "ACX":   {"name": "Across Protocol",  "qty": 2000.00,   "buy": 0.1444},
-    "APT":   {"name": "Aptos",            "qty": 50.00,     "buy": 3.86},
-    "W":     {"name": "Wormhole",         "qty": 2500.00,   "buy": 0.02056},
-    "AIUS":  {"name": "Arbius",           "qty": 100.00,    "buy": 26.63},
-    "SFG":   {"name": "SolForge Fusion",  "qty": 1000.00,   "buy": 0.3851},
-    "XPRT":  {"name": "Persistence",      "qty": 2621.00,   "buy": 0.01073},
-    "LAKE":  {"name": "Data Lake",        "qty": 270000.00, "buy": 0.00086022},
+
+# Mainstream coins — fetched from CryptoCompare (fast, reliable, no rate limits)
+CRYPTO_CC = {
+    "ATOM":  {"name": "Cosmos",          "qty": 225.00,   "buy": 5.59},
+    "ZRO":   {"name": "LayerZero",       "qty": 142.50,   "buy": 1.29},
+    "COW":   {"name": "CoW Protocol",    "qty": 1000.00,  "buy": 0.3339},
+    "PENGU": {"name": "Pudgy Penguins",  "qty": 25000.00, "buy": 0.021514},
+    "DOGE":  {"name": "Dogecoin",        "qty": 1750.00,  "buy": 0.091375},
+    "ZK":    {"name": "ZKsync",          "qty": 5000.00,  "buy": 0.057838},
+    "RSC":   {"name": "ResearchCoin",    "qty": 1000.00,  "buy": 0.30},
+    "SOL":   {"name": "Solana",          "qty": 1.00,     "buy": 175.00},
+    "FUEL":  {"name": "Fuel Network",    "qty": 60014.00, "buy": 0.006715},
+    "ACX":   {"name": "Across Protocol", "qty": 2000.00,  "buy": 0.1444},
+    "APT":   {"name": "Aptos",           "qty": 50.00,    "buy": 3.86},
+    "W":     {"name": "Wormhole",        "qty": 2500.00,  "buy": 0.02056},
+    "XPRT":  {"name": "Persistence",     "qty": 2621.00,  "buy": 0.01073},
 }
 
+# Small DEX-only coins — fetched from CoinGecko (correct IDs verified)
+CRYPTO_GECKO = {
+    "AIUS": {"name": "Arbius",          "qty": 100.00,    "buy": 26.63,      "gecko_id": "arbius"},
+    "SFG":  {"name": "SolForge Fusion", "qty": 1000.00,   "buy": 0.3851,     "gecko_id": "solforge-fusion"},
+    "LAKE": {"name": "Data Lake",       "qty": 270000.00, "buy": 0.00086022, "gecko_id": "data-lake"},
+}
+
+# Stocks
 STOCK = {
     "BTDR": {"name": "Bitdeer Technologies", "qty": 21.5, "buy": 9.45}
+}
+
+# Combined view (without gecko_id field)
+CRYPTO = {
+    **CRYPTO_CC,
+    **{k: {f: v[f] for f in ("name","qty","buy")} for k, v in CRYPTO_GECKO.items()}
 }
 
 # ── Conversation history ───────────────────────────────────────────────────────
@@ -58,22 +71,20 @@ MAX_HISTORY = 30
 
 # ── RSS News Feeds ─────────────────────────────────────────────────────────────
 NEWS_FEEDS = [
-    ("Reuters World",   "https://feeds.reuters.com/reuters/worldNews"),
-    ("Reuters Business","https://feeds.reuters.com/reuters/businessNews"),
-    ("Reuters US",      "https://feeds.reuters.com/Reuters/domesticNews"),
-    ("CNBC Economy",    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
-    ("BBC World",       "https://feeds.bbci.co.uk/news/world/rss.xml"),
-    ("FT Markets",      "https://www.ft.com/rss/home/us"),
+    ("Reuters World",    "https://feeds.reuters.com/reuters/worldNews"),
+    ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
+    ("Reuters US",       "https://feeds.reuters.com/Reuters/domesticNews"),
+    ("CNBC Economy",     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
+    ("BBC World",        "https://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("FT Markets",       "https://www.ft.com/rss/home/us"),
 ]
-
 CRYPTO_FEEDS = [
-    ("CoinDesk",        "https://www.coindesk.com/arc/outboundfeeds/rss/"),
-    ("CoinTelegraph",   "https://cointelegraph.com/rss"),
-    ("Decrypt",         "https://decrypt.co/feed"),
+    ("CoinDesk",      "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("CoinTelegraph", "https://cointelegraph.com/rss"),
+    ("Decrypt",       "https://decrypt.co/feed"),
 ]
 
-def fetch_rss(feeds: list, limit_per_feed=5) -> list[str]:
-    """Fetch headlines from RSS feeds."""
+def fetch_rss(feeds: list, limit_per_feed: int = 5) -> list[str]:
     headlines = []
     for name, url in feeds:
         try:
@@ -88,89 +99,121 @@ def fetch_rss(feeds: list, limit_per_feed=5) -> list[str]:
 
 # ── Price Fetching ─────────────────────────────────────────────────────────────
 
-async def fetch_crypto_prices() -> dict:
-    """Fetch crypto prices from CryptoCompare — free, reliable."""
-    symbols = ",".join(CRYPTO.keys())
-    url = f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={symbols}&tsyms=USD"
+async def fetch_cryptocompare() -> dict:
+    """CryptoCompare: all 13 mainstream coins in one request."""
+    fsyms = ",".join(CRYPTO_CC.keys())
+    url = f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={fsyms}&tsyms=USD"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(url)
             r.raise_for_status()
             raw = r.json().get("RAW", {})
-            return {
-                sym: {
-                    "price": raw[sym]["USD"]["PRICE"],
-                    "change24h": raw[sym]["USD"]["CHANGEPCT24HOUR"],
-                }
-                for sym in CRYPTO if sym in raw and "USD" in raw.get(sym, {})
-            }
+            result = {}
+            for sym in CRYPTO_CC:
+                if sym in raw and "USD" in raw[sym]:
+                    result[sym] = {
+                        "price":     raw[sym]["USD"]["PRICE"],
+                        "change24h": raw[sym]["USD"]["CHANGEPCT24HOUR"],
+                    }
+            logger.info(f"CryptoCompare: {len(result)}/{len(CRYPTO_CC)} coins")
+            return result
     except Exception as e:
-        logger.error(f"Crypto price fetch failed: {e}")
+        logger.error(f"CryptoCompare failed: {e}")
         return {}
+
+async def fetch_coingecko_small() -> dict:
+    """CoinGecko: only AIUS, SFG, LAKE (3 coins — minimal rate limit risk)."""
+    ids = ",".join(v["gecko_id"] for v in CRYPTO_GECKO.values())
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url)
+            if r.status_code == 429:
+                logger.warning("CoinGecko rate limited — AIUS/SFG/LAKE unavailable")
+                return {}
+            r.raise_for_status()
+            data = r.json()
+            gecko_to_sym = {v["gecko_id"]: k for k, v in CRYPTO_GECKO.items()}
+            result = {}
+            for gecko_id, vals in data.items():
+                sym = gecko_to_sym.get(gecko_id)
+                if sym:
+                    result[sym] = {
+                        "price":     vals.get("usd", 0) or 0,
+                        "change24h": vals.get("usd_24h_change", 0) or 0,
+                    }
+            logger.info(f"CoinGecko: {len(result)}/3 small coins")
+            return result
+    except Exception as e:
+        logger.error(f"CoinGecko failed: {e}")
+        return {}
+
+async def fetch_all_prices() -> tuple[dict, dict]:
+    """Fetch everything in parallel. Returns (crypto_prices, stock_prices)."""
+    cc, gecko = await asyncio.gather(fetch_cryptocompare(), fetch_coingecko_small())
+    crypto_prices = {**cc, **gecko}
+    stock_prices  = {sym: fetch_stock_price(sym) for sym in STOCK}
+    return crypto_prices, stock_prices
 
 def fetch_stock_price(ticker: str) -> dict:
-    """Fetch stock price using yfinance."""
     try:
-        t = yf.Ticker(ticker)
-        info = t.fast_info
+        info  = yf.Ticker(ticker).fast_info
         price = info.last_price
         prev  = info.previous_close
-        change = ((price - prev) / prev * 100) if prev else 0
-        return {"price": round(price, 2), "change24h": round(change, 2)}
+        chg   = ((price - prev) / prev * 100) if prev else 0
+        return {"price": round(price, 2), "change24h": round(chg, 2)}
     except Exception as e:
-        logger.error(f"Stock price fetch failed for {ticker}: {e}")
+        logger.error(f"Stock price failed for {ticker}: {e}")
         return {}
 
-# ── Portfolio Builders ─────────────────────────────────────────────────────────
+# ── Message Builders ───────────────────────────────────────────────────────────
 
 def build_prices_message(crypto_prices: dict, stock_prices: dict) -> str:
     now = datetime.now(UK_TZ).strftime("%a %d %b %Y, %H:%M %Z")
     lines = [f"📊 *Live Portfolio — {now}*\n"]
-
-    total_value = 0
-    total_cost  = 0
+    total_value = total_cost = 0
 
     lines.append("*🪙 Crypto*")
     for sym, h in CRYPTO.items():
-        p = crypto_prices.get(sym, {})
-        price  = p.get("price", 0)
-        chg    = p.get("change24h", 0)
-        value  = price * h["qty"]
-        cost   = h["buy"] * h["qty"]
-        pnl    = value - cost
-        pnl_p  = (pnl / cost * 100) if cost else 0
-        total_value += value
+        p     = crypto_prices.get(sym, {})
+        price = p.get("price", 0)
+        chg   = p.get("change24h", 0)
+        val   = price * h["qty"]
+        cost  = h["buy"] * h["qty"]
+        pnl   = val - cost
+        pnl_p = (pnl / cost * 100) if cost else 0
+        total_value += val
         total_cost  += cost
-        arrow = "🟢" if chg >= 0 else "🔴"
         if price > 0:
+            arrow = "🟢" if chg >= 0 else "🔴"
             lines.append(
-                f"{arrow} *{sym}* ${price:.4f} ({chg:+.1f}%)\n"
-                f"   Val: ${value:.0f} | P&L: ${pnl:+.0f} ({pnl_p:+.0f}%)"
+                f"{arrow} *{sym}* ${price:.4g} ({chg:+.1f}%)\n"
+                f"   Val: ${val:,.0f} | P&L: ${pnl:+,.0f} ({pnl_p:+.0f}%)"
             )
         else:
-            lines.append(f"⚪ *{sym}* — price unavailable")
+            lines.append(f"⚪ *{sym}* — unavailable")
 
     lines.append("\n*📈 Stocks*")
     for sym, h in STOCK.items():
-        p = stock_prices.get(sym, {})
+        p     = stock_prices.get(sym, {})
         price = p.get("price", 0)
         chg   = p.get("change24h", 0)
-        value = price * h["qty"]
+        val   = price * h["qty"]
         cost  = h["buy"] * h["qty"]
-        pnl   = value - cost
+        pnl   = val - cost
         pnl_p = (pnl / cost * 100) if cost else 0
-        total_value += value
+        total_value += val
         total_cost  += cost
-        arrow = "🟢" if chg >= 0 else "🔴"
         if price > 0:
+            arrow = "🟢" if chg >= 0 else "🔴"
             lines.append(
                 f"{arrow} *{sym}* ${price:.2f} ({chg:+.1f}%)\n"
-                f"   Val: ${value:.0f} | P&L: ${pnl:+.0f} ({pnl_p:+.0f}%)"
+                f"   Val: ${val:,.0f} | P&L: ${pnl:+,.0f} ({pnl_p:+.0f}%)"
             )
         else:
-            lines.append(f"⚪ *{sym}* — price unavailable")
+            lines.append(f"⚪ *{sym}* — unavailable")
 
-    total_pnl  = total_value - total_cost
+    total_pnl   = total_value - total_cost
     total_pnl_p = (total_pnl / total_cost * 100) if total_cost else 0
     lines.append(
         f"\n━━━━━━━━━━━━━━━━\n"
@@ -180,239 +223,242 @@ def build_prices_message(crypto_prices: dict, stock_prices: dict) -> str:
     return "\n".join(lines)
 
 def portfolio_for_ai(crypto_prices: dict, stock_prices: dict) -> str:
-    """Compact portfolio summary for AI context."""
-    lines = ["PORTFOLIO SNAPSHOT:"]
+    """Compact portfolio context injected into every AI prompt."""
+    lines = ["LIVE PORTFOLIO:"]
+    total_value = total_cost = 0
     for sym, h in CRYPTO.items():
         p     = crypto_prices.get(sym, {})
         price = p.get("price", 0)
         chg   = p.get("change24h", 0)
-        value = price * h["qty"]
+        val   = price * h["qty"]
         cost  = h["buy"] * h["qty"]
-        pnl_p = ((value - cost) / cost * 100) if cost else 0
-        lines.append(f"{sym}: price=${price:.6g} chg={chg:+.1f}% value=${value:.0f} pnl={pnl_p:+.0f}%")
+        pnl_p = ((val - cost) / cost * 100) if cost else 0
+        total_value += val
+        total_cost  += cost
+        lines.append(f"  {sym}: ${price:.5g} | {chg:+.1f}%/24h | val=${val:.0f} | pnl={pnl_p:+.0f}%")
     for sym, h in STOCK.items():
         p     = stock_prices.get(sym, {})
         price = p.get("price", 0)
         chg   = p.get("change24h", 0)
-        value = price * h["qty"]
+        val   = price * h["qty"]
         cost  = h["buy"] * h["qty"]
-        pnl_p = ((value - cost) / cost * 100) if cost else 0
-        lines.append(f"{sym} (stock): price=${price:.2f} chg={chg:+.1f}% value=${value:.0f} pnl={pnl_p:+.0f}%")
+        pnl_p = ((val - cost) / cost * 100) if cost else 0
+        total_value += val
+        total_cost  += cost
+        lines.append(f"  {sym} [STOCK]: ${price:.2f} | {chg:+.1f}%/24h | val=${val:.0f} | pnl={pnl_p:+.0f}%")
+    total_pnl   = total_value - total_cost
+    total_pnl_p = (total_pnl / total_cost * 100) if total_cost else 0
+    lines.append(f"TOTAL: val=${total_value:,.0f} | pnl=${total_pnl:+,.0f} ({total_pnl_p:+.1f}%)")
     return "\n".join(lines)
+
+def get_top_movers(crypto_prices: dict, stock_prices: dict, n: int = 4) -> str:
+    all_prices = {**crypto_prices, **stock_prices}
+    movers = sorted(all_prices.items(), key=lambda x: abs(x[1].get("change24h", 0)), reverse=True)
+    parts = []
+    for sym, p in movers[:n]:
+        chg = p.get("change24h", 0)
+        icon = "🚀" if chg > 5 else "🟢" if chg >= 0 else ("💥" if chg < -5 else "🔴")
+        parts.append(f"{icon} {sym} {chg:+.1f}%")
+    return "  ".join(parts)
 
 # ── Groq AI ────────────────────────────────────────────────────────────────────
 
-def build_system_prompt(crypto_prices: dict, stock_prices: dict) -> str:
-    now = datetime.now(UK_TZ).strftime("%A %d %B %Y, %H:%M %Z")
+def build_system(crypto_prices: dict, stock_prices: dict) -> str:
+    now  = datetime.now(UK_TZ).strftime("%A %d %B %Y, %H:%M %Z")
     port = portfolio_for_ai(crypto_prices, stock_prices)
-    return f"""You are a sharp, expert crypto and financial AI assistant embedded in a personal Telegram bot.
+    return f"""You are a sharp personal finance AI inside a Telegram bot. No fluff.
 
-TODAY: {now}
+DATE/TIME: {now}
 
 {port}
 
-USER'S HOLDINGS:
-Crypto: ATOM(225), ZRO(142.5), COW(1000), PENGU(25000), DOGE(1750), ZK(5000), RSC(1000), SOL(1), FUEL(60014), ACX(2000), APT(50), W(2500), AIUS(100), SFG(1000), XPRT(2621), LAKE(270000)
-Stock: BTDR Bitdeer Technologies (21.5 shares, bought at $9.45)
+RULES:
+- Give direct, honest opinions on buy/sell/hold — don't just list pros and cons forever
+- Use *bold* for key points, keep replies concise (Telegram, not an essay)
+- You know the portfolio above in real time — reference it naturally
+- No need to add disclaimers to every single message"""
 
-YOUR ROLE:
-- Give honest, direct investment opinions on the portfolio
-- Advise on buy/sell/hold decisions with reasoning
-- Discuss crypto and macro news intelligently
-- Remember context from earlier in this conversation
-
-STYLE:
-- Telegram formatting: use *bold*, keep responses concise
-- Use emojis naturally but not excessively  
-- Be direct — no waffle, no disclaimers unless truly needed
-- When asked for an opinion, give one — don't just list pros and cons endlessly"""
-
-async def ask_groq(user_message: str, crypto_prices: dict, stock_prices: dict) -> str:
+async def ask_groq(user_msg: str, crypto_prices: dict, stock_prices: dict) -> str:
     global history
-
-    system = build_system_prompt(crypto_prices, stock_prices)
-    history.append({"role": "user", "content": user_message})
+    history.append({"role": "user", "content": user_msg})
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
-
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [{"role": "system", "content": system}] + history,
-        "max_tokens": 1024,
-        "temperature": 0.7,
-    }
-
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 GROQ_URL,
-                headers={
-                    "Authorization": f"Bearer {GROQ_KEY}",
-                    "Content-Type": "application/json",
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model":       GROQ_MODEL,
+                    "messages":    [{"role": "system", "content": build_system(crypto_prices, stock_prices)}] + history,
+                    "max_tokens":  1024,
+                    "temperature": 0.7,
                 },
-                json=payload,
             )
             if r.status_code != 200:
-                logger.error(f"Groq error {r.status_code}: {r.text[:300]}")
-                return f"❌ AI error ({r.status_code}). Please try again."
+                logger.error(f"Groq {r.status_code}: {r.text[:200]}")
+                return f"❌ AI error ({r.status_code}) — try again."
             reply = r.json()["choices"][0]["message"]["content"]
             history.append({"role": "assistant", "content": reply})
             return reply
     except Exception as e:
-        logger.error(f"Groq request failed: {e}")
+        logger.error(f"Groq failed: {e}")
         return f"❌ AI request failed: {e}"
 
-async def send_safe(context_or_msg, text: str, chat_id=None):
-    """Send message, falling back to plain text if markdown fails."""
-    try:
-        if chat_id:
-            await context_or_msg.bot.send_message(
-                chat_id=chat_id, text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True
-            )
-        else:
-            await context_or_msg.edit_text(
-                text, parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True
-            )
-    except Exception:
+# ── Safe Send (markdown → plain fallback) ─────────────────────────────────────
+
+async def send_safe(target, text: str, chat_id: str = None):
+    strip = lambda t: re.sub(r'[*_`\[\]]', '', t)
+    for md, txt in [(True, text), (False, strip(text))]:
         try:
-            clean = re.sub(r'[*_`\[\]]', '', text)
+            kw = {"disable_web_page_preview": True}
+            if md:
+                kw["parse_mode"] = ParseMode.MARKDOWN
             if chat_id:
-                await context_or_msg.bot.send_message(
-                    chat_id=chat_id, text=clean,
-                    disable_web_page_preview=True
-                )
+                await target.bot.send_message(chat_id=chat_id, text=txt, **kw)
             else:
-                await context_or_msg.edit_text(clean, disable_web_page_preview=True)
+                await target.edit_text(txt, **kw)
+            return
         except Exception as e:
-            logger.error(f"send_safe failed: {e}")
+            if not md:
+                logger.error(f"send_safe failed completely: {e}")
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
 
 async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 *Your Personal Finance AI Assistant*\n\n"
-        "I monitor your crypto & stock portfolio and keep you informed.\n\n"
+    await update.message.reply_text(
+        "👋 *Your Personal Finance AI*\n\n"
         "*Commands:*\n"
-        "📊 /prices — live portfolio with P&L\n"
-        "🆘 /help — show this menu\n\n"
-        "💬 *Or just talk to me* — ask anything about your portfolio, markets, news, buy/sell advice.\n\n"
-        "_Daily briefing arrives every morning at 7:00am UK time_ ⏰"
+        "📊 /prices — live portfolio & P&L\n"
+        "🌅 /brief — morning briefing on demand\n"
+        "📋 /summary — honest portfolio analysis\n"
+        "🧹 /clear — reset conversation\n\n"
+        "💬 *Just type anything* — ask about your portfolio, news, buy/sell ideas.\n\n"
+        "_Auto briefing every day at 7:00am UK time_ ⏰",
+        parse_mode=ParseMode.MARKDOWN
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_prices(update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Fetching live prices...")
     try:
-        crypto_prices = await fetch_crypto_prices()
-        stock_prices  = {sym: fetch_stock_price(sym) for sym in STOCK}
-        text = build_prices_message(crypto_prices, stock_prices)
-        await send_safe(msg, text)
+        cp, sp = await fetch_all_prices()
+        await send_safe(msg, build_prices_message(cp, sp))
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}")
+
+async def cmd_brief(update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ Generating briefing...")
+    try:
+        await _run_briefing(context, reply_msg=msg)
+    except Exception as e:
+        await msg.edit_text(f"❌ Briefing failed: {e}")
+
+async def cmd_summary(update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ Analysing portfolio...")
+    try:
+        cp, sp = await fetch_all_prices()
+        reply  = await ask_groq(
+            "Give me an honest portfolio analysis. "
+            "Top winners and losers by P&L%. "
+            "Total value vs total invested. "
+            "Which positions are worth holding and which look like dead weight? "
+            "Be direct and sharp — not a list of bullet points about what each coin 'could' do.",
+            cp, sp
+        )
+        await send_safe(msg, f"📋 *Portfolio Analysis*\n\n{reply}")
     except Exception as e:
         await msg.edit_text(f"❌ Error: {e}")
 
 async def cmd_clear(update, context: ContextTypes.DEFAULT_TYPE):
     global history
     history = []
-    await update.message.reply_text("🧹 Conversation cleared!")
+    await update.message.reply_text("🧹 Conversation cleared. Fresh start!")
 
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
-    """AI agent handles all regular messages."""
     user_text = update.message.text
     msg = await update.message.reply_text("🤔 Thinking...")
     try:
-        crypto_prices = await fetch_crypto_prices()
-        stock_prices  = {sym: fetch_stock_price(sym) for sym in STOCK}
-        reply = await ask_groq(user_text, crypto_prices, stock_prices)
+        cp, sp = await fetch_all_prices()
+        reply  = await ask_groq(user_text, cp, sp)
         await send_safe(msg, reply)
     except Exception as e:
         await msg.edit_text(f"❌ Error: {e}")
 
-# ── Daily Morning Briefing ─────────────────────────────────────────────────────
+# ── Morning Briefing ───────────────────────────────────────────────────────────
 
-async def morning_briefing(context: ContextTypes.DEFAULT_TYPE):
-    """7am UK daily briefing: news + portfolio + AI insight."""
-    logger.info("Sending morning briefing...")
+async def _run_briefing(context: ContextTypes.DEFAULT_TYPE, reply_msg=None):
     now = datetime.now(UK_TZ).strftime("%A %d %B %Y")
+    cp, sp = await fetch_all_prices()
+    movers = get_top_movers(cp, sp)
+    world  = "\n".join(fetch_rss(NEWS_FEEDS,   limit_per_feed=4)[:20]) or "No headlines"
+    crypto = "\n".join(fetch_rss(CRYPTO_FEEDS, limit_per_feed=3)[:10]) or "No crypto news"
 
-    # 1. Fetch prices
-    try:
-        crypto_prices = await fetch_crypto_prices()
-        stock_prices  = {sym: fetch_stock_price(sym) for sym in STOCK}
-    except Exception as e:
-        logger.error(f"Price fetch in briefing failed: {e}")
-        crypto_prices, stock_prices = {}, {}
+    prompt = f"""Write my morning briefing for {now}. Sharp, concise, no fluff.
 
-    # 2. Fetch news headlines
-    world_headlines  = fetch_rss(NEWS_FEEDS,   limit_per_feed=4)
-    crypto_headlines = fetch_rss(CRYPTO_FEEDS, limit_per_feed=3)
-
-    # 3. Build briefing prompt
-    world_text  = "\n".join(world_headlines[:20])  or "No headlines available"
-    crypto_text = "\n".join(crypto_headlines[:10]) or "No crypto headlines available"
-    port_text   = portfolio_for_ai(crypto_prices, stock_prices)
-
-    briefing_prompt = f"""Generate my daily morning briefing for {now}. Be sharp and concise.
-
-WORLD/MACRO HEADLINES (select only truly important ones):
-{world_text}
+WORLD/MACRO HEADLINES:
+{world}
 
 CRYPTO HEADLINES:
-{crypto_text}
+{crypto}
 
-{port_text}
+TOP PORTFOLIO MOVERS: {movers}
 
-Structure the briefing EXACTLY like this:
+{portfolio_for_ai(cp, sp)}
 
-🌍 *GEOPOLITICAL & MACRO*
-(2-3 bullet points — only truly significant US/EU/Russia/China events, wars, major policy shifts. Skip fluff.)
+Use EXACTLY this format:
+
+🌍 *GEOPOLITICAL*
+• Only truly significant US/EU/Russia/China events. Wars, sanctions, major shifts. Skip minor stuff.
 
 📊 *MACRO ECONOMY*
-(2-3 bullet points — CPI, inflation, Fed/ECB decisions, major economic data. Only if relevant today.)
+• CPI, inflation, Fed/ECB moves, major data releases. Only include if relevant today.
 
 🪙 *CRYPTO & PORTFOLIO NEWS*
-(2-3 bullet points — relevant crypto news, especially for coins I hold. BTDR/Bitdeer news if any.)
+• Key crypto market developments. Any news related to coins I hold or Bitdeer (BTDR).
 
-📈 *PORTFOLIO SNAPSHOT*
-(3-4 biggest movers today with % change. Total portfolio value.)
+📈 *TOP MOVERS*
+• Biggest 24h moves in my portfolio with brief context on why.
 
-💡 *AI INSIGHT*
-(1-2 sentences — your single most important observation or action point for today.)
+💡 *KEY INSIGHT*
+One sharp, actionable observation for today.
 
-Keep the whole briefing under 400 words. Only include a section if there's genuinely important news for it."""
+Max 350 words. Skip any section with nothing genuinely important."""
 
+    reply = await ask_groq(prompt, cp, sp)
+    text  = f"🌅 *Morning Briefing — {now}*\n\n{reply}"
+    if reply_msg:
+        await send_safe(reply_msg, text)
+    else:
+        await send_safe(context, text, chat_id=CHAT_ID)
+
+async def morning_briefing(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Running scheduled morning briefing...")
     try:
-        reply = await ask_groq(briefing_prompt, crypto_prices, stock_prices)
-        header = f"🌅 *Morning Briefing — {now}*\n\n"
-        await send_safe(context, header + reply, chat_id=CHAT_ID)
+        await _run_briefing(context)
     except Exception as e:
         logger.error(f"Morning briefing failed: {e}")
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"⚠️ Morning briefing failed: {e}"
-        )
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ Morning briefing error: {e}")
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_start))
-    app.add_handler(CommandHandler("prices", cmd_prices))
-    app.add_handler(CommandHandler("clear",  cmd_clear))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("help",    cmd_start))
+    app.add_handler(CommandHandler("prices",  cmd_prices))
+    app.add_handler(CommandHandler("brief",   cmd_brief))
+    app.add_handler(CommandHandler("summary", cmd_summary))
+    app.add_handler(CommandHandler("clear",   cmd_clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Daily briefing at 7:00am UK time
     app.job_queue.run_daily(
         morning_briefing,
         time=dtime(hour=7, minute=0, tzinfo=UK_TZ),
         name="morning_briefing"
     )
 
-    logger.info("🚀 Bot is running!")
+    logger.info("🚀 Bot started!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
