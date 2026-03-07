@@ -336,14 +336,24 @@ async def cmd_clear(update, context: ContextTypes.DEFAULT_TYPE):
     save_memory(memory)
     await update.message.reply_text("🧹 Conversation history cleared!")
 
+async def safe_send(msg, text):
+    """Try markdown first, fall back to plain text."""
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    except Exception:
+        try:
+            await msg.edit_text(text, disable_web_page_preview=True)
+        except Exception as e:
+            await msg.edit_text(f"❌ Send error: {e}")
+
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    msg = await update.message.reply_text("🤔 _Thinking..._", parse_mode=ParseMode.MARKDOWN)
+    msg = await update.message.reply_text("🤔 Thinking...")
     try:
         prices = await fetch_all_prices()
         port_json = portfolio_as_json(prices)
         reply = await ask_claude(user_text, port_json)
-        await msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await safe_send(msg, reply)
     except Exception as e:
         await msg.edit_text(f"❌ Error: {e}")
 
