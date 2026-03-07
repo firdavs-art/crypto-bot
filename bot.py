@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import json
+from json import dumps as json_dumps
 from datetime import datetime
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -71,23 +72,72 @@ MAX_HISTORY = 20  # keep last 20 messages for context
 
 # ── API helpers ────────────────────────────────────────────────────────────────
 
-async def fetch_prices() -> dict:
-    ids = ",".join(PORTFOLIO.keys())
-    url = (
-        f"https://api.coingecko.com/api/v3/simple/price"
-        f"?ids={ids}&vs_currencies=usd&include_24hr_change=true"
-    )
-    for attempt in range(3):
+# Binance symbol mapping (coin_id -> Binance trading pair)
+BINANCE_SYMBOLS = {
+    "cosmos":          "ATOMUSDT",
+    "layerzero":       "ZROUSDT",
+    "cow-protocol":    "COWUSDT",
+    "pudgy-penguins":  "PENGUUSDT",
+    "dogecoin":        "DOGEUSDT",
+    "zksync":          "ZKUSDT",
+    "solana":          "SOLUSDT",
+    "fuel-network":    "FUELUSDT",
+    "aptos":           "APTUSDT",
+    "wormhole":        "WUSDT",
+}
+
+# Coins not on Binance — use CoinGecko as fallback (fewer coins = less rate limit risk)
+COINGECKO_FALLBACK = {
+    "researchcoin":   "researchcoin",
+    "across-protocol":"across-protocol",
+    "arbius":         "arbius",
+    "solforge":       "solforge",
+    "persistence":    "persistence",
+    "data-lake":      "data-lake",
+}
+
+async def fetch_prices_binance() -> dict:
+    """Fetch from Binance public API — no key, no rate limits, real-time."""
+    symbols = list(BINANCE_SYMBOLS.values())
+    url = "https://data-api.binance.vision/api/v3/ticker/24hr"
+    params = {"symbols": json.dumps(symbols)}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        results = {}
+        for item in r.json():
+            # find coin_id by matching Binance symbol
+            for coin_id, sym in BINANCE_SYMBOLS.items():
+                if item["symbol"] == sym:
+                    results[coin_id] = {
+                        "usd": float(item["lastPrice"]),
+                        "usd_24h_change": float(item["priceChangePercent"]),
+                    }
+        return results
+
+async def fetch_prices_coingecko_fallback() -> dict:
+    """Fetch smaller set of non-Binance coins from CoinGecko."""
+    ids = ",".join(COINGECKO_FALLBACK.keys())
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
+    try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(url)
             if r.status_code == 429:
-                wait = 15 * (attempt + 1)
-                logger.warning(f"CoinGecko rate limited, retrying in {wait}s...")
-                await asyncio.sleep(wait)
-                continue
+                logger.warning("CoinGecko fallback rate limited, skipping small coins.")
+                return {}
             r.raise_for_status()
             return r.json()
-    raise Exception("CoinGecko rate limit exceeded after 3 attempts. Try again in a minute.")
+    except Exception as e:
+        logger.warning(f"CoinGecko fallback failed: {e}")
+        return {}
+
+async def fetch_prices() -> dict:
+    """Fetch all prices: Binance (primary) + CoinGecko (fallback for small coins)."""
+    binance_data, gecko_data = await asyncio.gather(
+        fetch_prices_binance(),
+        fetch_prices_coingecko_fallback()
+    )
+    return {**binance_data, **gecko_data}
 
 async def fetch_fear_greed() -> dict:
     async with httpx.AsyncClient(timeout=10) as client:
