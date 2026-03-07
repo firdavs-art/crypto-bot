@@ -63,69 +63,52 @@ def save_memory(mem: dict):
 
 memory = load_memory()
 
-# ── Correct CoinGecko IDs for all coins ───────────────────────────────────────
-COINGECKO_IDS = {
-    "cosmos":          "cosmos",
-    "layerzero":       "layerzero",
-    "cow-protocol":    "cow-protocol",
-    "pudgy-penguins":  "pudgy-penguins",
-    "dogecoin":        "dogecoin",
-    "zksync":          "zksync",
-    "researchcoin":    "research-coin",
-    "solana":          "solana",
-    "fuel-network":    "fuel-network",
-    "across-protocol": "across-protocol",
-    "aptos":           "aptos",
-    "wormhole":        "wormhole",
-    "arbius":          "arbius",
-    "solforge":        "solforge-fusion",
-    "persistence":     "persistence",
-    "data-lake":       "data-lake",
+# ── CryptoCompare symbols (reliable free API, no rate limit issues) ─────────────
+# coin_id -> CryptoCompare symbol
+CC_SYMBOLS = {
+    "cosmos":          "ATOM",
+    "layerzero":       "ZRO",
+    "cow-protocol":    "COW",
+    "pudgy-penguins":  "PENGU",
+    "dogecoin":        "DOGE",
+    "zksync":          "ZK",
+    "researchcoin":    "RSC",
+    "solana":          "SOL",
+    "fuel-network":    "FUEL",
+    "across-protocol": "ACX",
+    "aptos":           "APT",
+    "wormhole":        "W",
+    "arbius":          "AIUS",
+    "solforge":        "SFG",
+    "persistence":     "XPRT",
+    "data-lake":       "LAKE",
 }
 
-# Split into 2 batches to reduce rate limit risk
-BATCH_1 = ["cosmos", "layerzero", "cow-protocol", "pudgy-penguins",
-           "dogecoin", "zksync", "researchcoin", "solana"]
-BATCH_2 = ["fuel-network", "across-protocol", "aptos", "wormhole",
-           "arbius", "solforge", "persistence", "data-lake"]
-
-async def fetch_coingecko_batch(client, coin_ids: list) -> dict:
-    """Fetch a batch of coins from CoinGecko."""
-    gecko_ids = ",".join(COINGECKO_IDS[c] for c in coin_ids)
-    try:
-        r = await client.get(
-            "https://api.coingecko.com/api/v3/simple/price"
-            f"?ids={gecko_ids}&vs_currencies=usd&include_24hr_change=true",
-            timeout=20
-        )
-        if r.status_code == 429:
-            logger.warning("CoinGecko rate limited on batch")
-            return {}
-        if r.status_code != 200:
-            logger.warning(f"CoinGecko error {r.status_code}")
-            return {}
-        data = r.json()
-        results = {}
-        # Map gecko_id back to our coin_id
-        reverse_map = {v: k for k, v in COINGECKO_IDS.items()}
-        for gecko_id, vals in data.items():
-            coin_id = reverse_map.get(gecko_id, gecko_id)
-            results[coin_id] = {
-                "price": vals.get("usd", 0),
-                "change_24h": vals.get("usd_24h_change", 0) or 0,
-            }
-        return results
-    except Exception as e:
-        logger.warning(f"CoinGecko batch failed: {e}")
-        return {}
-
 async def fetch_all_prices() -> dict:
-    """Fetch all prices using CoinGecko in 2 batches."""
-    async with httpx.AsyncClient() as client:
-        batch1 = await fetch_coingecko_batch(client, BATCH_1)
-        await asyncio.sleep(2)  # small delay between batches
-        batch2 = await fetch_coingecko_batch(client, BATCH_2)
-    return {**batch1, **batch2}
+    """Fetch all prices from CryptoCompare — free, reliable, no auth needed."""
+    symbols = ",".join(CC_SYMBOLS.values())
+    url = f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={symbols}&tsyms=USD"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                logger.warning(f"CryptoCompare error {r.status_code}: {r.text[:200]}")
+                return {}
+            data = r.json().get("RAW", {})
+            prices = {}
+            reverse = {v: k for k, v in CC_SYMBOLS.items()}
+            for symbol, vals in data.items():
+                coin_id = reverse.get(symbol)
+                if coin_id and "USD" in vals:
+                    prices[coin_id] = {
+                        "price": vals["USD"].get("PRICE", 0),
+                        "change_24h": vals["USD"].get("CHANGEPCT24HOUR", 0),
+                    }
+            logger.info(f"Fetched prices for {len(prices)} coins")
+            return prices
+    except Exception as e:
+        logger.error(f"CryptoCompare fetch failed: {e}")
+        return {}
 
 def build_portfolio_summary(prices: dict) -> str:
     lines = []
