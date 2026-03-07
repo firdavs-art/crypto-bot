@@ -96,24 +96,33 @@ COINGECKO_FALLBACK = {
     "data-lake":      "data-lake",
 }
 
-async def fetch_prices_binance() -> dict:
-    """Fetch from Binance public API — no key, no rate limits, real-time."""
-    symbols = list(BINANCE_SYMBOLS.values())
-    url = "https://data-api.binance.vision/api/v3/ticker/24hr"
-    params = {"symbols": json.dumps(symbols)}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, params=params)
+async def fetch_single_binance(client: httpx.AsyncClient, coin_id: str, symbol: str) -> tuple:
+    """Fetch a single coin from Binance."""
+    try:
+        r = await client.get(
+            "https://api.binance.com/api/v3/ticker/24hr",
+            params={"symbol": symbol},
+            timeout=15
+        )
         r.raise_for_status()
-        results = {}
-        for item in r.json():
-            # find coin_id by matching Binance symbol
-            for coin_id, sym in BINANCE_SYMBOLS.items():
-                if item["symbol"] == sym:
-                    results[coin_id] = {
-                        "usd": float(item["lastPrice"]),
-                        "usd_24h_change": float(item["priceChangePercent"]),
-                    }
-        return results
+        data = r.json()
+        return coin_id, {
+            "usd": float(data["lastPrice"]),
+            "usd_24h_change": float(data["priceChangePercent"]),
+        }
+    except Exception as e:
+        logger.warning(f"Binance fetch failed for {symbol}: {e}")
+        return coin_id, None
+
+async def fetch_prices_binance() -> dict:
+    """Fetch all Binance coins in parallel — fast and reliable."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        tasks = [
+            fetch_single_binance(client, coin_id, symbol)
+            for coin_id, symbol in BINANCE_SYMBOLS.items()
+        ]
+        results = await asyncio.gather(*tasks)
+    return {coin_id: data for coin_id, data in results if data is not None}
 
 async def fetch_prices_coingecko_fallback() -> dict:
     """Fetch smaller set of non-Binance coins from CoinGecko."""
