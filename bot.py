@@ -52,17 +52,6 @@ def load_memory() -> dict:
             "arbius": "AIUS", "solforge": "SFG", "persistence": "XPRT",
             "data-lake": "LAKE",
         },
-        "binance_pairs": {
-            "cosmos": "ATOMUSDT", "layerzero": "ZROUSDT", "cow-protocol": "COWUSDT",
-            "pudgy-penguins": "PENGUUSDT", "dogecoin": "DOGEUSDT", "zksync": "ZKUSDT",
-            "solana": "SOLUSDT", "fuel-network": "FUELUSDT", "aptos": "APTUSDT",
-            "wormhole": "WUSDT",
-        },
-        "coingecko_ids": {
-            "researchcoin": "researchcoin", "across-protocol": "across-protocol",
-            "arbius": "arbius", "solforge": "solforge",
-            "persistence": "persistence", "data-lake": "data-lake",
-        },
         "preferences": [],
         "tasks": [],
         "conversation": [],
@@ -74,50 +63,69 @@ def save_memory(mem: dict):
 
 memory = load_memory()
 
-# ── Price fetching ─────────────────────────────────────────────────────────────
+# ── Correct CoinGecko IDs for all coins ───────────────────────────────────────
+COINGECKO_IDS = {
+    "cosmos":          "cosmos",
+    "layerzero":       "layerzero",
+    "cow-protocol":    "cow-protocol",
+    "pudgy-penguins":  "pudgy-penguins",
+    "dogecoin":        "dogecoin",
+    "zksync":          "zksync",
+    "researchcoin":    "research-coin",
+    "solana":          "solana",
+    "fuel-network":    "fuel-network",
+    "across-protocol": "across-protocol",
+    "aptos":           "aptos",
+    "wormhole":        "wormhole",
+    "arbius":          "arbius",
+    "solforge":        "solforge-fusion",
+    "persistence":     "persistence",
+    "data-lake":       "data-lake",
+}
 
-async def get_price_binance(client, coin_id, pair):
+# Split into 2 batches to reduce rate limit risk
+BATCH_1 = ["cosmos", "layerzero", "cow-protocol", "pudgy-penguins",
+           "dogecoin", "zksync", "researchcoin", "solana"]
+BATCH_2 = ["fuel-network", "across-protocol", "aptos", "wormhole",
+           "arbius", "solforge", "persistence", "data-lake"]
+
+async def fetch_coingecko_batch(client, coin_ids: list) -> dict:
+    """Fetch a batch of coins from CoinGecko."""
+    gecko_ids = ",".join(COINGECKO_IDS[c] for c in coin_ids)
     try:
         r = await client.get(
-            f"https://api.binance.com/api/v3/ticker/24hr",
-            params={"symbol": pair}, timeout=10
+            "https://api.coingecko.com/api/v3/simple/price"
+            f"?ids={gecko_ids}&vs_currencies=usd&include_24hr_change=true",
+            timeout=20
         )
-        d = r.json()
-        return coin_id, float(d["lastPrice"]), float(d["priceChangePercent"])
+        if r.status_code == 429:
+            logger.warning("CoinGecko rate limited on batch")
+            return {}
+        if r.status_code != 200:
+            logger.warning(f"CoinGecko error {r.status_code}")
+            return {}
+        data = r.json()
+        results = {}
+        # Map gecko_id back to our coin_id
+        reverse_map = {v: k for k, v in COINGECKO_IDS.items()}
+        for gecko_id, vals in data.items():
+            coin_id = reverse_map.get(gecko_id, gecko_id)
+            results[coin_id] = {
+                "price": vals.get("usd", 0),
+                "change_24h": vals.get("usd_24h_change", 0) or 0,
+            }
+        return results
     except Exception as e:
-        logger.warning(f"Binance {pair} failed: {e}")
-        return coin_id, None, None
+        logger.warning(f"CoinGecko batch failed: {e}")
+        return {}
 
 async def fetch_all_prices() -> dict:
-    prices = {}
+    """Fetch all prices using CoinGecko in 2 batches."""
     async with httpx.AsyncClient() as client:
-        # Binance coins in parallel
-        tasks = [
-            get_price_binance(client, cid, pair)
-            for cid, pair in memory["binance_pairs"].items()
-        ]
-        for cid, price, chg in await asyncio.gather(*tasks):
-            if price:
-                prices[cid] = {"price": price, "change_24h": chg}
-
-        # CoinGecko for smaller coins
-        try:
-            ids = ",".join(memory["coingecko_ids"].keys())
-            r = await client.get(
-                f"https://api.coingecko.com/api/v3/simple/price"
-                f"?ids={ids}&vs_currencies=usd&include_24hr_change=true",
-                timeout=15
-            )
-            if r.status_code == 200:
-                for cid, data in r.json().items():
-                    prices[cid] = {
-                        "price": data.get("usd", 0),
-                        "change_24h": data.get("usd_24h_change", 0) or 0
-                    }
-        except Exception as e:
-            logger.warning(f"CoinGecko fallback failed: {e}")
-
-    return prices
+        batch1 = await fetch_coingecko_batch(client, BATCH_1)
+        await asyncio.sleep(2)  # small delay between batches
+        batch2 = await fetch_coingecko_batch(client, BATCH_2)
+    return {**batch1, **batch2}
 
 def build_portfolio_summary(prices: dict) -> str:
     lines = []
