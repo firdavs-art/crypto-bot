@@ -77,10 +77,17 @@ async def fetch_prices() -> dict:
         f"https://api.coingecko.com/api/v3/simple/price"
         f"?ids={ids}&vs_currencies=usd&include_24hr_change=true"
     )
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        return r.json()
+    for attempt in range(3):
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url)
+            if r.status_code == 429:
+                wait = 15 * (attempt + 1)
+                logger.warning(f"CoinGecko rate limited, retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+    raise Exception("CoinGecko rate limit exceeded after 3 attempts. Try again in a minute.")
 
 async def fetch_fear_greed() -> dict:
     async with httpx.AsyncClient(timeout=10) as client:
